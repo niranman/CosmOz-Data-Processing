@@ -1,0 +1,295 @@
+---
+title: "CosmOz Data Processing"
+author: "Niranjan Wimalathunge"
+date: "2023-08-16"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(warning = FALSE)
+```
+
+# Introduction
+A cosmic-ray soil moisture probe is designed to passively and non-invasively track water content within the uppermost 50cm of soil or the equivalent depth of water – even extending to 20cm of snow. Employing the cosmic-ray methodology, this technology encompasses an averaging range extending laterally up to roughly 300m at sea level, offering an unprecedented scale of observation. The mobile version of it, the rover, acquires neutron count data across the surface at one-minute intervals. However, it is essential to process these neutron counts to eliminate environmental influences and to calibrate them against field soil moisture measurements. The calibration parameter N0 (the neutron intensity above the dry soil) plays a pivotal role in this calibration process.
+
+### Libraries
+```{r,warning=FALSE,message=FALSE}
+library(raster)
+library(readxl)
+library(epiR)
+library(sp)
+library(rgdal)
+library(dplyr)
+library(sf)
+library(automap)
+library(mapview)
+```
+### Area of interest (BARS)
+```{r message=FALSE, warning=FALSE,echo=FALSE}
+Bars <- rgdal::readOGR('X:/PRJ-SoilWaterNow/data/Aus/Farms&sites/Bars/BARS_boundary.shp')
+sites <- read.csv('X:/PRJ-SoilWaterNow/data/Aus/Farms&sites/Bars/bars_sites.csv')[-1]
+names(sites)<-c("siteNo","long","lat")
+pts<-st_as_sf(sites, coords=c("long", "lat"))
+mapview(Bars,alpha.regions = 0.2, aplha = 1,legend=F)+mapview(pts,legend=F)
+```
+
+### Get data
+Use the [link](https://github.com/niranman/CosmOz-Data-Processing) to download the datasets and change the file paths accordingly
+Survey date: 2022-03-28
+
+### Fixed variables when process cosmos neutron count
+```{r}
+Pref<-1000.71 # (mb)Reference Pressure:Atmospheric Standards formula (en.wikipedia.org/wiki/Standard_atmospheric_pressure)
+x1<-1020.5 # (g cm-2)  Atmospheric depth:Reference pressure divided by gravity
+beta<-0.0076 # (mb-1)Atmospheric attentuation coeffcient:Desilets and Zreda (2003) equation 11
+SLref<-1013.25# (mb)Sea level reference pressure:Atmospheric Standards formula (en.wikipedia.org/wiki/Standard_atmospheric_pressure)
+x2<-1033.2 # (g cm-2) Reference pressure divided by gravity
+beta2<-0.0077 # (mb-1)Desilets and Zreda (2003) equation 11
+ScaleEle<-0.91 # Desilets and Zreda (2006) equation 7 modifed and provided by Darin Desilets
+ScaleLat<-0.93 # Desilets and Zreda (2006) equation 6
+SclaleLat1<-1.069669 # Latitude Scale (as multiplier)
+
+```
+### Cutoff Rigidity  
+Cutoff Rigidity Calculator "http://cosmos.hwr.arizona.edu/Util/rigidity.php"
+For a given lat/lon, this utility calculates the cutoff rigidity (GV) of incoming primary cosmic rays
+```{r}
+Rig=4.24 #Cutoff Rigidity at site= 4.24 GV
+```
+### Neutron count intensity from a selected monitoring site
+https://www.nmdb.eu/nest/
+follow the instruction in the given document
+```{r}
+LMKS<-read.csv("X:/PRJ-SoilWaterNow/data/Aus/Farms&sites/Bars/LMKS.csv")[-1]
+LMKS$Date<- strptime(LMKS$Date, format="%Y-%m-%d %H:%M:%S")
+```
+### Rover logger field names
+```{r,echo=FALSE}
+names<-c("RecordNum",	"Date", "PTB110_mb",	"P1_mb",	"T1_C"	,"RH1",	"T_CS215",	"RH_CS215",	"Vbat",
+         "N1Cts",	"N2Cts",	"N3Cts"	,"N4Cts",	"N5Cts"	,"N6Cts",	"N7Cts"	,"N8Cts",	"N9Cts",	"N10Cts",	"N11Cts",
+         "N12Cts"	,"N13Cts",	"N14Cts",	"N15Cts",	"N16Cts",	 "N1ETsec" ,	 "N2ETsec" ,	 "N3ETsec" ,	 "N4ETsec",
+         "N5ETsec" 	, "N6ETsec" ,	 "N7ETsec" ,	 "N8ETsec" ,	 "N9ETsec" ,	 "N10ETsec" ,	 "N11ETsec" ,	 "N12ETsec", 
+         "N13ETsec" ,	 "N14ETsec" ,	 "N15ETsec" ,	 "N16ETsec" ,	'GpsUTC',	 "LatDec"	, "LongDec"	, "Alt",
+         "Qual"	, "NumSats"	, "HDOP",	 "COG",	 "Speed_kmh",	 "SpeedQuality",	 "strDate")
+names
+```
+### Rover logger files
+Measurements are saved in the logger with the ROV extension.
+Save them as CSV
+```{r}
+cos1<-read.csv("X:/PRJ-SoilWaterNow/data/Aus/Cosmos/RoverData2022/2203282031-2022Bars.csv",header = T);names(cos1)<-names
+cos2<-read.csv("X:/PRJ-SoilWaterNow/data/Aus/Cosmos/RoverData2022/2203280451-2022Bars.csv",header = T);names(cos2)<-names
+cos<-rbind(cos1,cos2)
+```
+### Combine the Rover logger measurments with the neutron count intensity
+
+```{r}
+cos <- cos[ order(cos$Date , decreasing = T ),]
+cos$Date<- strptime(cos$Date, format="%Y/%m/%d %H:%M:%S")
+countAverage<-mean(LMKS$countInten)
+LMKS$IntenCorr<-LMKS$countInten/countAverage
+cos<-inner_join(cos, LMKS, by = "Date")
+```
+### Correct neutron count
+The cosmic-ray neutrons is influenced not only by hydrogen in soil water but also by other hydrogen pools. These factors impact the accuracy of neutron counts and needs to be removed.
+```{r}
+# fix coordinates
+cos<-cos[!(duplicated(cos$LatDec) & cos$LongDec), ]
+cos$LatDec<-paste("-",cos$LatDec,sep="")
+cos$LatDec<-as.numeric(cos$LatDec)
+cos<-as.data.frame(cos)
+
+countMin<-(cos$N1Cts*60/cos$N1ETsec)+(cos$N2Cts*60/cos$N2ETsec)+(cos$N3Cts*60/cos$N3ETsec)+(cos$N4Cts*60/cos$N4ETsec)+(cos$N5Cts*60/cos$N5ETsec)+(cos$N6Cts*60/cos$N6ETsec)+
+  (cos$N7Cts*60/cos$N7ETsec)+(cos$N8Cts*60/cos$N8ETsec)+(cos$N9Cts*60/cos$N9ETsec)+(cos$N10Cts*60/cos$N10ETsec)+(cos$N11Cts*60/cos$N11ETsec)+(cos$N12Cts*60/cos$N12ETsec)+
+  (cos$N13Cts*60/cos$N13ETsec)+(cos$N14Cts*60/cos$N14ETsec)+(cos$N15Cts*60/cos$N15ETsec)+(cos$N16Cts*60/cos$N16ETsec)
+
+vp<- (2165*((0.6108*exp((17.27*cos$T_CS215)/(cos$T_CS215+237.3)))*(cos$RH_CS215/100)))/(cos$T_CS215+273.16) #vp(g/m3)
+VapCorr<-(1+0.0054*(vp-0))
+PressCorr<-exp(0.0077*((cos$PTB110_mb-1013.25)))
+
+RefPress<-1013.25*exp(-1*(9.80665*0.0289644*cos$Alt)/(8.31447*288.15))
+AtmosDepth<-RefPress/(9.80655/10)
+AtmosAttenCoeff<-0.0054196+0.00022082*Rig+-0.00000051952*Rig^2+(0.0000072062+-0.0000019702*Rig)*AtmosDepth+(-0.0000000098334+0.0000000034201*Rig)*AtmosDepth^2+(0.0000000000049898+-0.0000000000017192*Rig)*AtmosDepth^3
+
+ElevationScale<-exp((AtmosDepth-x2)/(1/AtmosAttenCoeff))
+
+CorrCounts<-((countMin*PressCorr*VapCorr)/cos$IntenCorr)*ElevationScale*SclaleLat1
+cos$Counts<-CorrCounts
+CorrCounts
+```
+### Map the correct neutron count
+```{r}
+e<-extent(Bars)
+dem<-readRDS("X:/PRJ-SoilWaterNow/data/Aus/Farms&sites/Bars/dem.rds")
+slopeAspect <- raster::terrain(dem, opt = c("slope", "aspect"), unit = "degrees")
+
+S <- SpatialPoints(expand.grid(seq(e@xmin, e@xmax, length=100),
+                               seq(e@ymin, e@ymax, length=100)))
+gridded(S) <- TRUE
+
+# dataset to be predicted
+newdata<-as.data.frame(raster::extract(stack(dem,slopeAspect),S))
+newdata$x<-S@coords[1:10000]
+newdata$y<-S@coords[10001:20000]
+coordinates(newdata) <- ~x+y
+gridded(newdata) <- TRUE
+
+# map neutron count
+Ncount<-data.frame(x=cos$LongDec,y=cos$LatDec,count=cos$Counts)
+Ncount<-cbind(Ncount,raster::extract(stack(dem,slopeAspect), cbind(Ncount$x,Ncount$y)))
+Ncount<-na.omit(Ncount)
+coordinates(Ncount) = ~x+y
+
+# universal Kriging
+kr.grid <- autoKrige(count ~  dem  + slope , Ncount, newdata)
+r <-raster(kr.grid$krige_output)
+raster::crs(r)<-"+proj=longlat +datum=WGS84"
+op <- par(mar=rep(2, 4));lim <- par()
+Ncount<-raster::crop(r,Bars)
+Ncount<-raster::mask(Ncount,Bars)
+plot(Ncount,main=expression('Neutron count'));plot(Bars,add=T)
+dev.off()
+```
+### BARS farm data
+```{r}
+covariates<-read.csv("X:/PRJ-SoilWaterNow/data/Aus/Farms&sites/Bars/probesSoildata/bars_soil_data_smprobes.csv")
+covariates<-covariates[,c(1:3,6:7,11:13)];names(covariates)[1]<-"Probe_SenA"
+sites<-read.csv("X:/PRJ-SoilWaterNow/data/Aus/Farms&sites/Bars/probesSoildata/bars_smprobes_id_data.csv")
+covariates<-inner_join(sites[,7:9],covariates,by="Probe_SenA");names(covariates)[3:5]<-c("site_ID","Upper_depth","Lower_depth") 
+
+# covariates 0-30 cm
+covariates1<-filter(covariates,Lower_depth %in% c('10','20','30'))
+covariates1<-as.data.frame(covariates1 %>% group_by(site_ID)%>% summarise(across(everything(), mean)))[-c(4,5)]
+
+# add dem, slope to the covariates dataset####
+cov<-cbind(covariates1,as.data.frame(raster::extract(stack(dem,slopeAspect),cbind(covariates1$Longitude,covariates1$Latitude))))
+coordinates(cov) = ~ Longitude+Latitude
+```
+#### Clay
+```{r,warning=FALSE,message=FALSE}
+kr.grid <- autoKrige(clay ~  dem + slope  , cov, newdata)
+r <-raster(kr.grid$krige_output)
+proj4string(r)<-"+proj=longlat +datum=WGS84"
+op <- par(mar=rep(2, 4));lim <- par()
+r.crop<-raster::crop(r,Bars)
+Clay<-raster::mask(r.crop,Bars)
+plot(Clay,main=expression('Clay (0-30cm) %'));plot(Bars,add=T)
+dev.off()
+```
+#### Lattice water
+```{r,warning=FALSE,message=FALSE}
+# derived from clay use of a PTF
+waterLat<-0.00075*Clay+0.0121
+plot(waterLat,main=expression('Lattice Water (0-30cm) %'));plot(Bars,add=T)
+dev.off()
+```
+#### Carbon
+```{r,warning=FALSE,message=FALSE}
+kr.grid <- autoKrige(SOC ~  dem  + slope , cov, newdata)
+r <-raster(kr.grid$krige_output)
+proj4string(r)<-"+proj=longlat +datum=WGS84"
+op <- par(mar=rep(2, 4));lim <- par()
+Carbon<-raster::crop(r,Bars)
+Carbon<-raster::mask(Carbon,Bars)
+plot(Carbon,main=expression('Carbon (0-30cm) %'));plot(Bars,add=T)
+dev.off()
+```
+#### Bulk Density
+```{r,warning=FALSE,message=FALSE}
+kr.grid <- autoKrige(bulk_density ~  dem  + slope , cov, newdata)
+r <-raster(kr.grid$krige_output)
+proj4string(r)<-"+proj=longlat +datum=WGS84"
+op <- par(mar=rep(2, 4));lim <- par()
+r.crop<-raster::crop(r,Bars)
+BD<-raster::mask(r.crop,Bars)
+plot(BD,main=expression('Bulk density (0-30cm) %'));plot(Bars,add=T)
+dev.off()
+```
+#### Field soil moisture (0-10cm)
+```{r,warning=FALSE,message=FALSE}
+# Field measurements for the calibration
+SM<-na.omit(read.csv("X:/PRJ-PAHGISL/Soil/Point/Farms/Boorowa/2022_borrowa_moisture.csv")[,c(1:3,8)])
+coords<-read.csv("X:/PRJ-PAHGISL/Soil/Point/Farms/Boorowa/samplecoordinatesBars2023.csv")
+SM<-inner_join(SM, coords, by = "Site_ID");names(SM)[4]<-"sm"
+SM<-cbind(SM,as.data.frame(raster::extract(stack(dem,slopeAspect),cbind(SM$long,SM$lat))))
+coordinates(SM) = ~ long+lat
+
+kr.grid <- autoKrige(sm ~  dem  + slope , SM, newdata)
+r <-raster(kr.grid$krige_output)
+proj4string(r)<-"+proj=longlat +datum=WGS84"
+op <- par(mar=rep(2, 4));lim <- par()
+r.crop<-raster::crop(r,Bars)
+SM<-raster::mask(r.crop,Bars)
+plot(SM/100,main=expression('Field soil moisture (0-10cm) - Volumetric moisture (cm'^"3"*' cm'^"-3"*")"));plot(Bars,add=T)
+dev.off()
+```
+### Calibration
+The corrected neutron counts from the cosmic-ray soil moisture probe are converted to volumetric soil water content using a calibration function
+
+The neutron intensity above the dry soil(N0) is determined by calculating the soil water using the calibration equation farm while changing the N0. Subsequently, the corresponding RMSE (Root Mean Square Error) against the surveyed soil water is calculated. This method is applied to the collected neutron count measurements. The clay, carbon, bulk density, lattice water, and farm soil moisture values are extracted from corresponding interpolated maps.The best N0 is selected, where it gives the lowest RMSE.
+```{r}
+# calculate the nnote (N0)
+cosmos<-data.frame(x=cos$LongDec,y=cos$LatDec,count=cos$Counts)
+cosmos$Carbon<-raster::extract(Carbon,cbind(cosmos$x,cosmos$y))*0.556/100
+cosmos$BD<-raster::extract(BD,cbind(cosmos$x,cosmos$y))
+cosmos$Clay<-raster::extract(Clay,cbind(cosmos$x,cosmos$y))
+cosmos$waterLat<-0.00075*cosmos$Clay+0.0121
+cosmos$SM<-(raster::extract(SM,cbind(cosmos$x,cosmos$y))*cosmos$BD)/100
+cosmos$CorrCounts<-raster::extract(Ncount,cbind(cosmos$x,cosmos$y))
+cosmos<-na.omit(cosmos)
+
+df<-NULL
+nnotedf<-NULL
+l<-seq(1,1000,1)#first run
+for (b in 1:2){
+  for (a in 1:length(l)){
+    neutron<-(cosmos$CorrCounts/l[a])-0.372 # calibration fuction
+    theta<-((0.0808/neutron)-0.115-cosmos$waterLat-(cosmos$Carbon))*cosmos$BD #calibration function
+    
+    #validation
+    lins_con <-epi.ccc(theta,cosmos$SM,ci = "z-transform",conf.level = 0.95)
+    specify_decimal <- function(x, k) format(round(x, k), nsmall=k)
+    lab <- paste("CCC: ", round(lins_con$rho.c[,1], digits = 2))
+    rmse<-sqrt(mean((theta-cosmos$SM)^2))
+    
+    df<-data.frame(l[a],lab,rmse)
+    nnotedf<-rbind(nnotedf,df)
+    
+    a=a+1
+  }
+  nnote<-nnotedf[nnotedf$rmse==min(nnotedf$rmse),]$l.a   
+  l<-seq(nnote-1,nnote+1,0.001)#second run
+}
+nnote
+```
+### Evaluation of CosmOz measurements
+The corresponding lowest RMSE, highest LCCC, and correlation occur at the optimal N0.
+```{r}
+neutron<-(cosmos$CorrCounts/nnote)-0.372
+cosmos$theta<-((0.0808/neutron)-0.115-cosmos$waterLat-(cosmos$Carbon))*cosmos$BD
+
+lins_con <-epi.ccc(cosmos$theta,cosmos$SM,ci = "z-transform",conf.level = 0.95)
+specify_decimal <- function(x, k) format(round(x, k), nsmall=k)
+lab <- paste("CCC: ", round(lins_con$rho.c[,1], digits = 2))
+rmse<-sqrt(mean((cosmos$theta-cosmos$SM)^2))
+plot(cosmos$theta,cosmos$SM,xlim = c(.0, 0.5), ylim = c(.0,0.5),xlab =expression(bold('CosmOz - Volumetric moisture (cm'^"3"*' cm'^"-3"*")")), 
+     ylab =expression(bold('Field - Volumetric moisture (cm'^"3"*' cm'^"-3"*")")), col=rgb(0, 0, 0, 0.7), pch = 16,main="0-10 cm",font=2)
+
+abline(0,1,lwd = 2)
+
+rmse<-sqrt(mean((cosmos$theta-cosmos$SM)^2))
+legend(x = "topleft", legend = c("Concordance correlation",lab),bty = "n")
+text(0.05,0.42, paste("RMSE =", round(rmse,2)))
+text(0.04,0.39, paste("Cor =", round(cor(cosmos$theta,cosmos$SM),2)))
+dev.off()
+```
+### Map the cosmos soil moisture
+```{r}
+neutron<-(Ncount/nnote)-0.372
+cosmos10<-((0.0808/neutron)-0.115-waterLat-(Carbon*0.556/100))*BD
+plot(cosmos10,main=expression('CosmOz (0-10cm) - Volumetric moisture (cm'^"3"*' cm'^"-3"*")"));plot(Bars,add=T)
+```
+
